@@ -41,16 +41,25 @@ impl Searcher {
         let mut scored_apps: Vec<(i64, AppInfo)> = apps
             .iter()
             .filter_map(|app| {
-                self.matcher
-                    .fuzzy_match(&app.name, query)
-                    .map(|mut score| {
-                        // Apply history-based ranking boost
-                        if let Some(hist_item) = history.items.iter().find(|i| i.path == app.path.to_string_lossy()) {
-                            // Significant boost for frequently used items to ensure they stay on top
-                            score += (hist_item.count as i64) * 50; 
-                        }
-                        (score, app.clone())
-                    })
+                let name_score = self.matcher.fuzzy_match(&app.name, query).unwrap_or(0);
+                let path_score = self.matcher.fuzzy_match(&app.path.to_string_lossy(), query).unwrap_or(0);
+                
+                let mut score = std::cmp::max(name_score, path_score);
+                
+                // Only apply history boost if the query actually matches the item reasonably well.
+                // This prevents 'popular' apps from appearing for completely unrelated queries.
+                if score > 20 {
+                    if let Some(hist_item) = history.items.iter().find(|i| i.path == app.path.to_string_lossy()) {
+                        // Adaptive boost: more boost for better matches
+                        score += (hist_item.count as i64) * 30; 
+                    }
+                }
+                
+                if score > 0 {
+                    Some((score, app.clone()))
+                } else {
+                    None
+                }
             })
             .collect();
 
