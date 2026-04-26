@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
 use crate::config;
 use walkdir::WalkDir;
 use anyhow::{Result, anyhow};
+use serde_json;
 use windows::{
     core::{PCWSTR, Interface},
     Win32::{
@@ -29,6 +31,7 @@ use windows::{
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /** Data structure representing a discovered application or file. */
 #[derive(Debug, Clone)]
@@ -54,49 +57,133 @@ pub fn scan_apps() -> Vec<AppInfo> {
         // User-specific Start Menu
         let mut start_menu = user_dirs.home_dir().to_path_buf();
         start_menu.push("AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs");
-        paths_to_scan.push(start_menu);
+        paths_to_scan.push((start_menu, 5));
         
         // Standard libraries
-        if let Some(path) = user_dirs.desktop_dir() { paths_to_scan.push(path.to_path_buf()); }
-        if let Some(path) = user_dirs.document_dir() { paths_to_scan.push(path.to_path_buf()); }
-        if let Some(path) = user_dirs.download_dir() { paths_to_scan.push(path.to_path_buf()); }
-        if let Some(path) = user_dirs.picture_dir() { paths_to_scan.push(path.to_path_buf()); }
-        if let Some(path) = user_dirs.video_dir() { paths_to_scan.push(path.to_path_buf()); }
-        if let Some(path) = user_dirs.audio_dir() { paths_to_scan.push(path.to_path_buf()); }
+        if let Some(path) = user_dirs.desktop_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+        if let Some(path) = user_dirs.document_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+        if let Some(path) = user_dirs.download_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+        if let Some(path) = user_dirs.picture_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+        if let Some(path) = user_dirs.video_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+        if let Some(path) = user_dirs.audio_dir() { paths_to_scan.push((path.to_path_buf(), 5)); }
+
+        // WindowsApps (aliases for Store apps and CLI tools)
+        let mut win_apps = user_dirs.home_dir().to_path_buf();
+        win_apps.push("AppData\\Local\\Microsoft\\WindowsApps");
+        paths_to_scan.push((win_apps, 1));
     }
     
     // ─── 2. SYSTEM-WIDE LOCATIONS ───────────────────────────────────
     // Global Start Menu (C:\ProgramData)
-    paths_to_scan.push(PathBuf::from("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"));
+    paths_to_scan.push((PathBuf::from("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"), 5));
 
     // ─── 3. SECONDARY DRIVES ────────────────────────────────────────
     // Automatically include USB drives and secondary fixed disks (D:, E:, etc.)
     for drive in get_extra_drives() {
-        paths_to_scan.push(drive);
+        paths_to_scan.push((drive, 5));
     }
 
     // ─── 4. CUSTOM USER PATHS ───────────────────────────────────────
     for path in config.extra_paths {
-        paths_to_scan.push(path);
+        paths_to_scan.push((path, 5));
     }
 
+    // ─── 5. SYSTEM LOCATIONS ────────────────────────────────────────
+    // Add C:\Windows and System32 for common utilities (shallow scan)
+    paths_to_scan.push((PathBuf::from("C:\\Windows"), 1));
+    paths_to_scan.push((PathBuf::from("C:\\Windows\\System32"), 1));
+
     // Perform recursive scanning for each resolved path
-    for path in paths_to_scan {
+    for (path, depth) in paths_to_scan {
         if path.exists() {
-            scan_directory(&path, &mut apps);
+            scan_directory(&path, &mut apps, depth);
         }
     }
 
+    // ─── 6. START APPS (UWP & SYSTEM) ────────────────────────────────
+    // Use PowerShell to get the full list of apps registered in the Start Menu
+    // This catches modern apps (like Notepad, Calculator, etc.) that aren't in the filesystem as .lnk files
+    scan_start_apps(&mut apps);
+
     apps
+}
+
+/** 
+ * Uses PowerShell's Get-StartApps to retrieve all registered applications.
+ * This is essential for finding UWP apps and system tools with localized names.
+ */
+fn scan_start_apps(apps: &mut Vec<AppInfo>) {
+    // --- STEP 1: Get-StartApps (Fast, provides localized names) ---
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    if let Ok(output) = output {
+        if let Ok(json_str) = String::from_utf8(output.stdout) {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                let items = if let Some(arr) = json_val.as_array() { arr.clone() } else if json_val.is_object() { vec![json_val] } else { Vec::new() };
+                for item in items {
+                    if let (Some(name), Some(appid)) = (item["Name"].as_str(), item["AppID"].as_str()) {
+                        let name = name.trim();
+                        let appid = appid.trim();
+                        let shell_path = format!("shell:AppsFolder\\{}", appid);
+                        if !apps.iter().any(|a| a.path.to_string_lossy() == shell_path) {
+                            apps.push(AppInfo { name: name.to_string(), path: PathBuf::from(shell_path) });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // This script finds technical names and family names for all installed Appx packages.
+    // It attempts to find the first Application ID in the manifest for a valid shell link.
+    let pm_script = "Get-AppxPackage | ForEach-Object { \
+        $p = $_; \
+        try { \
+            $m = [xml](Get-AppxPackageManifest -Package $p).GetXml(); \
+            $id = $m.Package.Applications.Application.Id; \
+            if ($id -is [array]) { $id = $id[0] } \
+            if ($id) { [PSCustomObject]@{ Name=$p.Name; ID=\"$($p.PackageFamilyName)!$id\" } } \
+        } catch { \
+            [PSCustomObject]@{ Name=$p.Name; ID=\"$($p.PackageFamilyName)!App\" } \
+        } \
+    } | ConvertTo-Json";
+    
+    let output_pm = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", pm_script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    if let Ok(output) = output_pm {
+        if let Ok(json_str) = String::from_utf8(output.stdout) {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                let items = if let Some(arr) = json_val.as_array() { arr.clone() } else if json_val.is_object() { vec![json_val] } else { Vec::new() };
+                for item in items {
+                    if let (Some(name), Some(appid)) = (item["Name"].as_str(), item["ID"].as_str()) {
+                        let shell_path = format!("shell:AppsFolder\\{}", appid);
+                        if !apps.iter().any(|a| a.path.to_string_lossy().contains(appid.split('!').next().unwrap_or(appid))) {
+                            let clean_name = name.split('.').last().unwrap_or(name).replace("Microsoft", "");
+                            apps.push(AppInfo { 
+                                name: clean_name.to_string(), 
+                                path: PathBuf::from(shell_path) 
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** 
  * Recursively traverses a directory to find relevant files and subdirectories.
  * Limits depth to 5 levels to maintain performance and avoid deep system hierarchies.
  */
-fn scan_directory(dir: &Path, apps: &mut Vec<AppInfo>) {
+fn scan_directory(dir: &Path, apps: &mut Vec<AppInfo>, max_depth: usize) {
     for entry in WalkDir::new(dir)
-        .max_depth(5) 
+        .max_depth(max_depth) 
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
