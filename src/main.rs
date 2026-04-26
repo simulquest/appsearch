@@ -218,7 +218,6 @@ fn main() -> anyhow::Result<()> {
                 println!(">>> SUCCESS: Index updated with {} items.", lock.len());
             }
             println!(">>> Rescan complete.");
-            // Drain pending requests to avoid redundant scans
             while rescan_rx.try_recv().is_ok() {}
         }
         println!("Background rescan thread is shutting down.");
