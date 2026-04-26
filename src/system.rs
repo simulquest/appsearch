@@ -1,4 +1,7 @@
 use std::process::Command;
+use std::os::windows::process::CommandExt;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /* 
  * System Control Module
@@ -12,6 +15,7 @@ use std::process::Command;
 pub fn lock() {
     let _ = Command::new("rundll32.exe")
         .args(["user32.dll,LockWorkStation"])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }
 
@@ -19,6 +23,7 @@ pub fn lock() {
 pub fn sleep() {
     let _ = Command::new("rundll32.exe")
         .args(["powrprof.dll,SetSuspendState", "0,1,0"])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }
 
@@ -44,6 +49,7 @@ pub fn set_volume(percent: f32) -> anyhow::Result<()> {
     
     Command::new("powershell")
         .args(["-Command", &ps_script])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }
@@ -58,6 +64,7 @@ pub fn set_brightness(percent: u8) -> anyhow::Result<()> {
     );
     Command::new("powershell")
         .args(["-Command", &cmd])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }
