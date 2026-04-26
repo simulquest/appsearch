@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::time::Duration;
+use std::os::windows::process::CommandExt;
 use slint::ComponentHandle;
 
 /* 
@@ -74,6 +75,7 @@ pub fn start_timer<T: ComponentHandle + 'static>(text: &str, _ui_handle: slint::
                     // This creates a NotifyIcon COM object and shows a BalloonTip.
                     let _ = std::process::Command::new("powershell")
                         .args(["-Command", "Add-Type -AssemblyName System.Windows.Forms; $notify = New-Object System.Windows.Forms.NotifyIcon; $notify.Icon = [System.Drawing.SystemIcons]::Information; $notify.Visible = $true; $notify.ShowBalloonTip(5000, 'APPSearch Timer', 'Your timer has finished!', [System.Windows.Forms.ToolTipIcon]::Info); Start-Sleep -s 6; $notify.Dispose()"])
+                        .creation_flags(0x08000000)
                         .spawn();
                 });
                 return true;
